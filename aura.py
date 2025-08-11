@@ -23,6 +23,7 @@ from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, ConfusionMatrixMetric
 from monai.utils import set_determinism
 from tqdm import tqdm
+from torch.cuda.amp import GradScaler, autocast
 
 # For reproducibility
 set_determinism(seed=42)
@@ -136,14 +137,28 @@ class AuraViT(nn.Module):
         self.cf = cf
 
         # --- ViT ENCODER (from UNETR) ---
-        self.patch_embed = nn.Linear(cf["patch_size"]*cf["patch_size"]*cf["num_channels"], cf["hidden_dim"])
+        # Improved patch embedding with layer norm and dropout
+        self.patch_embed = nn.Sequential(
+            nn.Linear(cf["patch_size"]*cf["patch_size"]*cf["num_channels"], cf["hidden_dim"]),
+            nn.LayerNorm(cf["hidden_dim"]),
+            nn.Dropout(cf["dropout_rate"])
+        )
         self.positions = torch.arange(start=0, end=cf["num_patches"], step=1, dtype=torch.long)
         self.pos_embed = nn.Embedding(cf["num_patches"], cf["hidden_dim"])
+        
+        # Add position dropout for better regularization
+        self.pos_dropout = nn.Dropout(cf["dropout_rate"])
+        
         self.trans_encoder_layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=cf["hidden_dim"], nhead=cf["num_heads"], dim_feedforward=cf["mlp_dim"],
                 dropout=cf["dropout_rate"], activation=F.gelu, batch_first=True
             ) for _ in range(cf["num_layers"])
+        ])
+        
+        # Add skip connection normalization for better gradient flow
+        self.skip_norms = nn.ModuleList([
+            nn.LayerNorm(cf["hidden_dim"]) for _ in range(4)
         ])
 
         # --- VAE HEAD ---
@@ -204,14 +219,18 @@ class AuraViT(nn.Module):
 
         positions = self.positions.to(inputs.device)
         pos_embed = self.pos_embed(positions)
-        x = patch_embed + pos_embed
+        # Add position dropout for better regularization
+        x = self.pos_dropout(patch_embed + pos_embed)
 
         skip_connection_index = [2, 5, 8, 11]
         skip_connections = []
         for i, layer in enumerate(self.trans_encoder_layers):
             x = layer(x)
             if i in skip_connection_index:
-                skip_connections.append(x)
+                # Apply normalization to skip connections for better gradient flow
+                norm_idx = len(skip_connections)
+                normalized_skip = self.skip_norms[norm_idx](x)
+                skip_connections.append(normalized_skip)
         z3, z6, z9, z12_features = skip_connections
 
         # 2. VAE Head and Reparameterization
@@ -256,7 +275,7 @@ class AuraViTLoss(nn.Module):
     2. MSELoss for the VAE reconstruction task.
     3. KL Divergence loss to regularize the VAE's latent space.
     """
-    def __init__(self, seg_weight=1.0, recon_weight=0.1, kl_weight=0.01):
+    def __init__(self, seg_weight=1.0, recon_weight=0.05, kl_weight=0.005):
         super().__init__()
         self.seg_loss = DiceCELoss(to_onehot_y=False, sigmoid=True)
         self.recon_loss = nn.MSELoss()
@@ -264,7 +283,7 @@ class AuraViTLoss(nn.Module):
         self.recon_weight = recon_weight
         self.kl_weight = kl_weight
 
-    def forward(self, seg_preds, seg_labels, recon_preds, recon_labels, mu, log_var):
+    def forward(self, seg_preds, seg_labels, recon_preds, recon_labels, mu, log_var, epoch=None):
         # Segmentation Loss
         segmentation_loss = self.seg_loss(seg_preds, seg_labels)
 
@@ -275,10 +294,19 @@ class AuraViTLoss(nn.Module):
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
         kl_loss = kl_loss / seg_preds.shape[0] # Normalize by batch size
 
+        # Progressive loss weight scheduling - gradually introduce VAE losses
+        if epoch is not None:
+            vae_factor = min(epoch / 30, 1.0)  # Ramp up VAE losses over first 30 epochs
+            effective_recon_weight = self.recon_weight * vae_factor
+            effective_kl_weight = self.kl_weight * vae_factor
+        else:
+            effective_recon_weight = self.recon_weight
+            effective_kl_weight = self.kl_weight
+
         # Total Weighted Loss
         total_loss = (self.seg_weight * segmentation_loss +
-                      self.recon_weight * reconstruction_loss +
-                      self.kl_weight * kl_loss)
+                      effective_recon_weight * reconstruction_loss +
+                      effective_kl_weight * kl_loss)
 
         return total_loss, segmentation_loss, reconstruction_loss, kl_loss
 
@@ -295,14 +323,21 @@ def main():
             MASK_DIR = os.path.join(DATA_DIR, "masks")
             CHECKPOINT_PATH = "training_checkpoint_AuraViT_NSCLC.pth"
             BEST_MODEL_PATH = "best_AuraViT_model_NSCLC.pth"
-            BATCH_SIZE = 8
-            LEARNING_RATE = 1e-6
-            MAX_EPOCHS = 125
+            
+            # IMPROVED HYPERPARAMETERS
+            BATCH_SIZE = 4  # Reduced due to model complexity
+            LEARNING_RATE = 1e-4  # Increased from 1e-6 for better convergence
+            MAX_EPOCHS = 200  # Increased for better training
+            WARMUP_EPOCHS = 10  # Add warmup period for stable training
+            PATIENCE = 15  # Increased patience for early stopping
+            WEIGHT_DECAY = 1e-4  # Improved weight decay
+            
             DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Improved model configuration with better dropout
         model_config = {
             "image_size": 256, "num_layers": 12, "hidden_dim": 768, "mlp_dim": 3072,
-            "num_heads": 12, "dropout_rate": 0.1, "patch_size": 16, "num_channels": 1,
+            "num_heads": 12, "dropout_rate": 0.15, "patch_size": 16, "num_channels": 1,
         }
         model_config["num_patches"] = (model_config["image_size"] // model_config["patch_size"]) ** 2
         config = TrainingConfig()
@@ -358,12 +393,30 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
 
         # ======================================================================================
-        # UPDATED MODEL, LOSS, OPTIMIZER
+        # IMPROVED MODEL, LOSS, OPTIMIZER SETUP
         # ======================================================================================
         model = AuraViT(model_config).to(config.DEVICE)
         loss_function = AuraViTLoss()
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.2, patience=4)
+        
+        # Improved optimizer with better hyperparameters
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=config.LEARNING_RATE, 
+            weight_decay=config.WEIGHT_DECAY,
+            betas=(0.9, 0.999)
+        )
+        
+        # Warmup + Cosine Annealing Scheduler for better training dynamics
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=config.WARMUP_EPOCHS
+        )
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.MAX_EPOCHS - config.WARMUP_EPOCHS, eta_min=1e-7
+        )
+        
+        # Mixed precision training for better memory usage and speed
+        scaler = GradScaler()
+        
         dice_metric = DiceMetric(include_background=True, reduction="mean")
         post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
 
@@ -372,51 +425,66 @@ def main():
         # ======================================================================================
         start_epoch = 0; best_metric = -1; best_metric_epoch = -1
         epoch_loss_values = []; metric_values = []
+        patience_counter = 0
 
         if os.path.exists(config.CHECKPOINT_PATH):
             checkpoint = torch.load(config.CHECKPOINT_PATH, map_location=config.DEVICE)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch']
             best_metric = checkpoint.get('best_metric', best_metric)
             epoch_loss_values = checkpoint.get('epoch_loss_values', epoch_loss_values)
             metric_values = checkpoint.get('metric_values', metric_values)
-            resume_msg = f"\n✅ Checkpoint found! Resuming training from epoch {start_epoch}.\n"
+            patience_counter = checkpoint.get('patience_counter', patience_counter)
+            resume_msg = f"\nCheckpoint found! Resuming training from epoch {start_epoch}.\n"
             print(resume_msg); report_file.write(resume_msg)
         else:
-            start_msg = "\nℹ️ No checkpoint found. Starting training from scratch.\n"
+            start_msg = "\nNo checkpoint found. Starting training from scratch.\n"
             print(start_msg); report_file.write(start_msg)
 
         # ======================================================================================
-        # UPDATED TRAINING AND VALIDATION LOOP
+        # IMPROVED TRAINING AND VALIDATION LOOP
         # ======================================================================================
         report_file.write("="*50 + "\n" + "AuraViT TRAINING LOG\n" + "="*50 + "\n")
         for epoch in range(start_epoch, config.MAX_EPOCHS):
             model.train(); epoch_loss = 0
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.MAX_EPOCHS} [Training]", unit="batch")
+            
             for batch_data in progress_bar:
                 inputs, labels = batch_data["image"].to(config.DEVICE), batch_data["label"].to(config.DEVICE)
                 optimizer.zero_grad()
 
-                # --- NEW MODEL FORWARD PASS ---
-                seg_outputs, recon_outputs, mu, log_var = model(inputs)
-                total_loss, seg_loss, recon_loss, kl_loss = loss_function(
-                    seg_outputs, labels, recon_outputs, inputs, mu, log_var
-                )
+                # Mixed precision forward pass
+                with autocast():
+                    seg_outputs, recon_outputs, mu, log_var = model(inputs)
+                    total_loss, seg_loss, recon_loss, kl_loss = loss_function(
+                        seg_outputs, labels, recon_outputs, inputs, mu, log_var, epoch=epoch
+                    )
 
-                total_loss.backward()
-                optimizer.step()
+                # Mixed precision backward pass with gradient clipping
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+
                 epoch_loss += total_loss.item()
                 progress_bar.set_postfix({
                     "Total Loss": f"{total_loss.item():.4f}",
                     "Seg": f"{seg_loss.item():.4f}",
                     "Recon": f"{recon_loss.item():.4f}",
-                    "KL": f"{kl_loss.item():.4f}"
+                    "KL": f"{kl_loss.item():.4f}",
+                    "LR": f"{optimizer.param_groups[0]['lr']:.2e}"
                 })
 
             avg_epoch_loss = epoch_loss / len(train_loader)
             epoch_loss_values.append(avg_epoch_loss)
+
+            # Learning rate scheduling
+            if epoch < config.WARMUP_EPOCHS:
+                warmup_scheduler.step()
+            else:
+                main_scheduler.step()
 
             model.eval()
             with torch.no_grad():
@@ -424,7 +492,7 @@ def main():
                 for val_data in val_loader:
                     val_inputs, val_labels = val_data["image"].to(config.DEVICE), val_data["label"].to(config.DEVICE)
                     
-                    # --- VALIDATION FORWARD PASS (only need seg_outputs) ---
+                    # Validation forward pass (only need seg_outputs)
                     seg_outputs, _, _, _ = model(val_inputs)
                     
                     val_outputs_post = [post_pred(i) for i in decollate_batch(seg_outputs)]
@@ -432,29 +500,38 @@ def main():
                 metric = dice_metric.aggregate().item()
                 metric_values.append(metric)
 
-            scheduler.step(metric)
-            summary = f"Epoch {epoch + 1} Summary | Avg Total Loss: {avg_epoch_loss:.4f} | Val Dice: {metric:.4f}"
+            summary = f"Epoch {epoch + 1} Summary | Avg Total Loss: {avg_epoch_loss:.4f} | Val Dice: {metric:.4f} | Best Dice: {best_metric:.4f}"
             tqdm.write(summary); report_file.write(summary + "\n")
 
+            # Improved early stopping and model saving
             if metric > best_metric:
-                best_metric = metric; best_metric_epoch = epoch + 1
+                best_metric = metric; best_metric_epoch = epoch + 1; patience_counter = 0
                 torch.save(model.state_dict(), config.BEST_MODEL_PATH)
-                save_msg = f"🏆 New best model saved! Best Dice: {best_metric:.4f} at epoch {best_metric_epoch}"
+                save_msg = f"New best model saved! Best Dice: {best_metric:.4f} at epoch {best_metric_epoch}"
                 tqdm.write(save_msg); report_file.write(save_msg + "\n")
+            else:
+                patience_counter += 1
 
+            # Save checkpoint with patience counter
             torch.save({
                 'epoch': epoch + 1, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(), 'best_metric': best_metric,
-                'epoch_loss_values': epoch_loss_values, 'metric_values': metric_values
+                'best_metric': best_metric, 'epoch_loss_values': epoch_loss_values, 'metric_values': metric_values,
+                'patience_counter': patience_counter
             }, config.CHECKPOINT_PATH)
 
-        training_summary = f"\n🏁 Training finished. Best Dice score of {best_metric:.4f} at epoch {best_metric_epoch}."
+            # Early stopping check
+            if patience_counter >= config.PATIENCE:
+                early_stop_msg = f"Early stopping triggered at epoch {epoch + 1}. No improvement for {config.PATIENCE} epochs."
+                tqdm.write(early_stop_msg); report_file.write(early_stop_msg + "\n")
+                break
+
+        training_summary = f"\nTraining finished. Best Dice score of {best_metric:.4f} at epoch {best_metric_epoch}."
         print(training_summary); report_file.write(training_summary + "\n\n")
 
         # ======================================================================================
         # PLOTTING (No changes needed here, but will plot total loss)
         # ======================================================================================
-        print("\n📈 Plotting training curves...")
+        print("\nPlotting training curves...")
         plt.figure("train", (12, 6))
         plt.subplot(1, 2, 1); plt.title("Epoch Average Total Loss")
         plt.plot(range(1, len(epoch_loss_values) + 1), epoch_loss_values); plt.xlabel("Epoch"); plt.ylabel("Loss")
@@ -465,7 +542,7 @@ def main():
         # ======================================================================================
         # UPDATED FINAL EVALUATION ON TEST SET
         # ======================================================================================
-        print("\n🧪 Running final evaluation on the test set...")
+        print("\nRunning final evaluation on the test set...")
         test_ds = Dataset(data=test_files, transform=val_transforms)
         test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=2)
 
@@ -480,7 +557,7 @@ def main():
             for test_data in tqdm(test_loader, desc="Testing"):
                 test_inputs, test_labels = test_data["image"].to(config.DEVICE), test_data["label"].to(config.DEVICE)
                 
-                # --- TEST FORWARD PASS ---
+                # Test forward pass
                 test_seg_outputs, _, _, _ = model(test_inputs)
                 
                 test_outputs_post = [post_pred(i) for i in decollate_batch(test_seg_outputs)]
@@ -497,7 +574,7 @@ def main():
         iou_test = mean_dice_test / (2 - mean_dice_test) if mean_dice_test > 0 else 0
         
         metrics_summary = (
-            f"\n📊 Final Test Metrics (AuraViT):\n"
+            f"\nFinal Test Metrics (AuraViT):\n"
             f"  - Mean Dice Score: {mean_dice_test:.4f}\n"
             f"  - Intersection over Union (IoU): {iou_test:.4f}\n"
             f"  - Sensitivity (Recall): {sensitivity:.4f}\n"
@@ -509,7 +586,7 @@ def main():
         # ======================================================================================
         # UPDATED VISUALIZATION
         # ======================================================================================
-        print("\n🎨 Visualizing predictions on test samples...")
+        print("\nVisualizing predictions on test samples...")
         model.load_state_dict(torch.load(config.BEST_MODEL_PATH))
         model.to(config.DEVICE)
         model.eval()
