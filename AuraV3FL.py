@@ -129,7 +129,7 @@ class AtrousConv(nn.Module):
         return self.atrous_conv(x)
 
 class ASPP(nn.Module):
-    """Atrous Spatial Pyramid Pooling module."""
+    """Atrous Spatial Pyramid Pooling module with BatchNorm fix."""
     def __init__(self, in_channels, out_channels, rates):
         super().__init__()
         self.conv_1x1 = nn.Sequential(
@@ -140,12 +140,14 @@ class ASPP(nn.Module):
         self.atrous_blocks = nn.ModuleList([
             AtrousConv(in_channels, out_channels, rate) for rate in rates
         ])
+        
+        # Fix: Remove BatchNorm from global_avg_pool to avoid the batch size issue
         self.global_avg_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True),  # Enable bias since no BatchNorm
             nn.ReLU(inplace=True)
         )
+        
         self.output_conv = nn.Sequential(
             nn.Conv2d(out_channels * (len(rates) + 2), out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -567,7 +569,7 @@ def load_federated_checkpoint(filepath, device):
     """Load federated learning checkpoint with error handling."""
     if os.path.exists(filepath):
         try:
-            checkpoint = torch.load(filepath, map_location=device)
+            checkpoint = torch.load(filepath, map_location=device, weights_only=False)
             logger.info(f"Checkpoint loaded from {filepath}")
             return checkpoint
         except Exception as e:
